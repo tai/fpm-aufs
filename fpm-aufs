@@ -1,0 +1,170 @@
+#!/bin/sh -e
+
+usage() {
+  P=$(basename $0)
+  cat <<EOF >&2
+$P - fpm(1) wrapper for quick and easy (DEB|RPM|etc) package building.
+Usage: $P <fpm-options> [-- build command...]
+Example:
+  # cd hello
+  # ./configure && make && $P -t deb -n hello -v 1.0 -- make install
+  # ls ../*.deb
+  hello_1.0_amd64.deb
+
+  OR
+
+  # cd hello-1.0   <- note the <package>-<version> folder name
+  # ./configure && make && $P -t deb -- make install
+  # ls ../*.deb
+  hello_1.0_amd64.deb
+
+EOF
+  exit 1
+}
+
+######################################################################
+
+has_arg() {
+  local arg=$1; shift
+
+  while [ $# -gt 0 ]; do
+    eval "case '$1' in $arg) return 0;; esac"
+    shift
+  done
+  return 1
+}
+
+run_fpm() {
+  local dirname package version args
+  dirname=${FPM_USERDIR##*/}
+  package=${dirname%-*}
+  version=${dirname##*-}
+
+  # assume as "v1.0" when dirname is not in <package>-<version> format.
+  test "$package" = "$version" && version=1.0
+
+  has_arg "-v|--vers*" "$@" || args="$args -v $version"
+  has_arg "-n|--na*"   "$@" || args="$args -n $package"
+
+  if ! has_arg "--it*" "$@"; then
+    case "$FPM_AUFS_ITERATION_STYLE" in
+    epoch) args="$args --iteration $(date +%s)";;
+    epoch+user) args="$args --iteration $(date +%s)+$USER";;
+    epoch+sudo) args="$args --iteration $(date +%s)+$SUDO_USER";;
+    datetime) args="$args --iteration $(date +%Y%m%d%H%M%S)";;
+    esac
+  fi
+
+  $NORUN fpm "$@" $args
+}
+
+prepare_fs() {
+  local mnt=$1 rw=$1/rw ro=$1/ro fs=$1/root
+
+  # QUOTE: "10GB of disk ought to be enough for anybody."
+  truncate -s 10G $mnt.bin
+
+  # prepare loopback fs
+  mkfs -t xfs -q $mnt.bin || mkfs -F -q $mnt.bin
+  mkdir $mnt
+  mount $mnt.bin $mnt
+  rm $mnt.bin
+
+  # prepare unionfs
+  mkdir -p $rw $fs
+  ln -s / $ro
+  mount -t aufs -o br:$rw:$ro=ro none $fs
+
+  mkdir -p $fs$FPM_USERDIR
+  mount --rbind $FPM_USERDIR $fs$FPM_USERDIR
+
+  echo $mnt $rw $ro $fs
+}
+
+######################################################################
+
+do_make() {
+  # run build commands
+  #chroot . sh -c "(cd $FPM_USERDIR && PS1='fpm# ' exec bash --norc)"
+
+  BUILD_COMMAND="$@" expect \
+  -c "spawn chroot . $SHELL" \
+  -c '
+send {PS1="fpm# "}
+send "\n"
+send "cd $::env(FPM_USERDIR)\n"
+if {[string length $::env(BUILD_COMMAND)]} {
+  send "($::env(BUILD_COMMAND)) && exit\n"
+}
+interact
+'
+}
+
+do_list() {
+  cat <<EOF
+##format: fpm-aufs-1.0
+#
+# Edit following list to pick file(s) to package.
+# You can either remove or comment-out the line to exclude.
+#
+EOF
+
+  # list files, but exclude obviously unwanted files
+  find . -type f | sed '/\/\.wh\.\.wh\./d; /^\.\/(root|tmp)/d'
+}
+
+do_work() {
+  local $(set -- $(prepare_fs TMP); echo mnt=$1 rw=$2 ro=$3 fs=$4)
+
+  local fpm_arg
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --) shift; break;;
+     *) fpm_arg="$fpm_arg '$1'"; shift;;
+    esac
+  done
+
+  (cd $fs && do_make "$@")
+
+  umount -lf $fs
+
+  (cd $rw && do_list) > $mnt/wanted.txt
+
+  # allow user to edit what files to include
+  tty > /dev/null && ${EDITOR:=vi} $mnt/wanted.txt
+
+  # generate package
+  if egrep -v '(^#|^[[:space:]]*$)' $mnt/wanted.txt > $mnt/wanted.tmp; then
+    eval run_fpm -s dir -C $rw --inputs $mnt/wanted.tmp $fpm_arg
+  fi
+
+  umount -lf $mnt && rmdir $mnt
+
+  # transfer any other generated file(s), if any
+  test "$(echo *)" = "*" || mv * $FPM_USERDIR/..
+}
+
+######################################################################
+cleanup() {
+  local wd="$1"
+
+  for i in $wd/TMP/root $wd/TMP; do
+    test -d $i && umount -lf $i && rmdir $i
+  done
+  rm -f $wd/TMP.bin
+
+  rmdir $wd
+}
+
+run() {
+  export FPM_USERDIR FPM_TEMPDIR
+  FPM_USERDIR=$PWD
+  FPM_TEMPDIR=$(mktemp -d --tmpdir=${TMPDIR:=/var/tmp} -t .fpm-aufs.$$.XXXXXX)
+
+  trap "cleanup $FPM_TEMPDIR" 0 1 2 3 14 15
+
+  (cd "$FPM_TEMPDIR" && do_work "$@")
+}
+
+test $# -gt 1 || usage
+run "$@"
