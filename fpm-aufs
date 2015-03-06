@@ -135,7 +135,7 @@ do_work() {
 
   # generate package
   if egrep -v '(^#|^[[:space:]]*$)' $mnt/wanted.txt > $mnt/wanted.tmp; then
-    eval run_fpm -s dir -C $rw --inputs $mnt/wanted.tmp $fpm_arg
+    eval run_fpm -s dir -C $rw --inputs $mnt/wanted.tmp $fpm_arg $FPM_AUFS_ARGS
   fi
 
   umount -lf $mnt && rmdir $mnt
